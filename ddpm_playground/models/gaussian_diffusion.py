@@ -1,7 +1,7 @@
 import math
 import random
 from collections import namedtuple
-from typing import Optional
+from typing import Optional, Tuple
 from functools import partial
 
 import torch
@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from einops import reduce
+from pytorch_lightning.loggers import WandbLogger
+from torchvision.utils import make_grid
+from PIL import Image
 
 ModelPrediction = namedtuple("ModelPrediction", ["pred_noise", "pred_x_start"])
 
@@ -57,11 +60,13 @@ class GaussianDiffusion(pl.LightningModule):
         p2_loss_weight_k: float = 1.,
         ddim_sampling_eta: float = 1.,
         learning_rate: float = 1e-3,
+        num_val_samples: int = 32,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
 
         self.model = model
+        self.in_channels = model.in_channels
         self.self_condition = model.self_condition
 
         self.image_size = image_size
@@ -141,12 +146,22 @@ class GaussianDiffusion(pl.LightningModule):
         )
 
         self.learning_rate = learning_rate
+        self.num_val_samples = num_val_samples
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False):
         model_output = self.model(x, t, x_self_cond)
@@ -241,6 +256,108 @@ class GaussianDiffusion(pl.LightningModule):
         x = x * 2 - 1
         return self.p_losses(x, t)
 
+    def p_mean_variance(
+        self,
+        x: torch.Tensor,
+        t: int,
+        x_self_cond: Optional[torch.Tensor] = None,
+        clip_denoised: bool = True,
+    ):
+        preds = self.model_predictions(x, t, x_self_cond)
+        x_start = preds.pred_x_start
+
+        if clip_denoised:
+            x_start.clamp_(-1., 1.)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
+            x_start=x_start, x_t=x, t=t
+        )
+        return model_mean, posterior_variance, posterior_log_variance, x_start
+
+    @torch.no_grad()
+    def p_sample(
+        self,
+        x: torch.Tensor,
+        t: int,
+        x_self_cond: Optional[torch.Tensor] = None,
+        clip_denoised: bool = True,
+    ):
+        batched_times = torch.full((x.shape[0],), t, dtype=torch.long, device=x.device)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(
+            x=x, t=batched_times, x_self_cond=x_self_cond, clip_denoised=clip_denoised
+        )
+        noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
+        pred_imgs = model_mean + (0.5 * model_log_variance).exp() * noise
+        return pred_imgs, x_start
+
+    @torch.no_grad()
+    def p_sample_loop(self, shape: Tuple[int, int, int, int]):
+        batch, device = shape[0], self.betas.device
+
+        imgs = torch.randn(shape, device=device)
+
+        x_start = None
+
+        for t in reversed(range(0, self.timesteps)):
+            self_cond = x_start if self.self_condition else None
+            imgs, x_start = self.p_sample(imgs, t, x_self_cond=self_cond)
+
+        imgs = (imgs + 1) * 0.5
+        return imgs
+
+    @torch.no_grad()
+    def ddim_sample(
+        self,
+        shape: Tuple[int, int, int, int],
+        clip_denoised: bool = True
+    ):
+        batch, device = shape[0], self.betas.device
+        total_timesteps, sampling_timesteps = self.timesteps, self.sampling_timesteps
+        eta, objective = self.ddim_sampling_eta, self.objective
+
+        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        imgs = torch.randn(shape, device = device)
+
+        x_start = None
+
+        for time, time_next in time_pairs:
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(
+                imgs, time_cond, self_cond, clip_x_start=clip_denoised
+            )
+
+            if time_next < 0:
+                imgs = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(imgs)
+
+            imgs = x_start * alpha_next.sqrt() + \
+                   c * pred_noise + \
+                   sigma * noise
+
+        imgs = (imgs +  1) * 0.5
+        return imgs
+
+    @torch.no_grad()
+    def sample(self, batch_size: int = 16):
+        shape = (batch_size, self.in_channels, self.image_size, self.image_size)
+        if self.is_ddim_sampling:
+            return self.ddim_sample(shape)
+        else:
+            return self.p_sample_loop(shape)
+
     def training_step(self, batch, batch_idx: int):
         loss = self.forward(batch)
 
@@ -249,7 +366,16 @@ class GaussianDiffusion(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx: int):
-        print("validation_step")
+        imgs = self.sample(self.num_val_samples)
+
+        if self.logger and isinstance(self.logger, WandbLogger):
+            images = []
+            for img in imgs:
+                grid = make_grid(img)
+                grid = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0)
+                ndarr = grid.to("cpu", torch.uint8).numpy()
+                images.append(Image.fromarray(ndarr))
+            self.logger.log_image(key="val/sample", images=images)
 
     def configure_optimizers(self):
         return torch.optim.Adam(

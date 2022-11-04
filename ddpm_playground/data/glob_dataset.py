@@ -13,12 +13,14 @@ class GlobDataset(Dataset):
         root_path: Path,
         pattern: str = "*.png",
         recursive: bool = False,
+        repeat: int = 1,
         loader: Callable = Image.open,
         transform: Optional[Callable] = None,
     ):
         self.root_path = root_path
         self.pattern = pattern
         self.recursive = recursive
+        self.repeat = repeat
         self.loader = loader
         self.transform = transform
 
@@ -26,7 +28,7 @@ class GlobDataset(Dataset):
             glob_func = self.root_path.rglob
         else:
             glob_func = self.root_path.glob
-        self.sample_paths = list(glob_func(pattern))
+        self.sample_paths = list(glob_func(pattern)) * self.repeat
 
     def __len__(self):
         return len(self.sample_paths)
@@ -51,6 +53,7 @@ class GlobDatasetForGM(pl.LightningDataModule):
         root_path: str,
         pattern: str = "*.jpg",
         recursive: bool = False,
+        repeat: int = 1,
         image_size: int = 128,
         batch_size: int = 256,
         num_workers: int = 16,
@@ -61,6 +64,7 @@ class GlobDatasetForGM(pl.LightningDataModule):
         self.root_path = Path(root_path)
         self.pattern = pattern
         self.recursive = recursive
+        self.repeat = repeat
         self.image_size = image_size
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -77,6 +81,7 @@ class GlobDatasetForGM(pl.LightningDataModule):
             root_path=self.root_path,
             pattern=self.pattern,
             recursive=self.recursive,
+            repeat=self.repeat,
             loader=Image.open,
             transform=transform,
         )
