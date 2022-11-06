@@ -3,6 +3,7 @@ import random
 from collections import namedtuple
 from typing import Optional, Tuple
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -61,6 +62,7 @@ class GaussianDiffusion(pl.LightningModule):
         ddim_sampling_eta: float = 1.,
         learning_rate: float = 1e-3,
         num_val_samples: int = 32,
+        num_test_samples: int = 128,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -147,6 +149,7 @@ class GaussianDiffusion(pl.LightningModule):
 
         self.learning_rate = learning_rate
         self.num_val_samples = num_val_samples
+        self.num_test_samples = num_test_samples
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -376,6 +379,23 @@ class GaussianDiffusion(pl.LightningModule):
                 ndarr = grid.to("cpu", torch.uint8).numpy()
                 images.append(Image.fromarray(ndarr))
             self.logger.log_image(key="val/sample", images=images)
+
+    def test_step(self, batch, batch_idx: int):
+        num_batches = math.ceil(self.num_test_samples / 16)
+
+        save_dir = Path("results")
+        if not save_dir.exists():
+            save_dir.mkdir(parents=True)
+
+        for i in range(num_batches):
+            imgs = self.sample(16)
+
+            for j, img in enumerate(imgs):
+                grid = make_grid(img)
+                grid = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0)
+                ndarr = grid.to("cpu", torch.uint8).numpy()
+                img = Image.fromarray(ndarr)
+                img.save(save_dir / f"{i * 16 + j:08d}.png")
 
     def configure_optimizers(self):
         return torch.optim.Adam(

@@ -30,20 +30,19 @@ model:
     learning_rate: 0.00001
 
 trainer:
-  max_epochs: 200
+  max_epochs: 100
   accelerator: "gpu"
   precision: 16
-  devices: 2
-  strategy: ddp
+  devices: 1
 
   logger:
     - class_path: ddpm_playground.utils.logger.WandbLogger
       init_args:
         project: ddpm-playground
         entity: viv
-        name: Debug
-        notes: "Debug"
-        tags: ["Debug"]
+        name: ddpm_ct
+        notes: "DDPM CT"
+        tags: ["DDPM", "CT"]
         save_code: True
 
   callbacks:
